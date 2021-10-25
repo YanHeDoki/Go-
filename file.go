@@ -18,10 +18,20 @@ type filelog struct {
 	maxFileSize int64    //最大文件大小
 	checkmodel  string   //切割模式，输入time以小时分隔，输入size以文件大小分隔
 	logH        int      //按几小时切割
+	logchan     chan *logMsg
+}
+type logMsg struct {
+	level     LogLevel
+	msg       string
+	funcName  string
+	filName   string
+	timestmpe string
+	line      int
 }
 
 //获取现在的时间的小时
 var logtime int
+var maxchan = 50000
 
 //构造方法
 func NewFilelog(lv, fp, fn, model string, logH int, maxsize int64) *filelog {
@@ -38,6 +48,7 @@ func NewFilelog(lv, fp, fn, model string, logH int, maxsize int64) *filelog {
 		maxFileSize: maxsize,
 		logH:        logH,
 		checkmodel:  model,
+		logchan:     make(chan *logMsg, maxchan),
 	}
 	err2 := f1.initFile()
 	if err2 != nil {
@@ -70,6 +81,10 @@ func (f *filelog) initFile() error {
 	f.errFileObj = errfileObj
 	f.fileObj = fileObj
 	//f.Close()
+	//for i := 0; i < 2; i++ {
+	//	go f.writelLogBackground()
+	//}
+	go f.writelLogBackground()
 	return nil
 
 }
@@ -137,13 +152,8 @@ func (f *filelog) splitFile(file *os.File) (*os.File, error) {
 	return f2, nil
 }
 
-//log 日志打印方法
-func (f *filelog) log(lv LogLevel, format string, arg ...interface{}) {
-	if f.enable(lv) {
-		msg := fmt.Sprintf(format, arg...)
-		t := time.Now()
-		funcname, filename, lineNo := getInfo(3)
-
+func (f *filelog) writelLogBackground() {
+	for {
 		if f.chckModel(f.checkmodel) {
 			newfile, err := f.splitFile(f.fileObj)
 			if err != nil {
@@ -151,18 +161,51 @@ func (f *filelog) log(lv LogLevel, format string, arg ...interface{}) {
 			}
 			f.fileObj = newfile
 		}
-		fmt.Fprintf(f.fileObj, "[%s] [%s][%s: %s: %d] %s \n", t.Format("2006-01-02 15:04:05"), paserLogString(lv), filename, funcname, lineNo, msg)
-		if lv >= ERROR {
+		select {
+		case logTmp := <-f.logchan:
+			logInfo := fmt.Sprintf("[%s] [%s][%s: %s: %d] %s \n", logTmp.timestmpe, paserLogString(logTmp.level), logTmp.filName, logTmp.funcName, logTmp.line, logTmp.msg)
+			fmt.Fprintf(f.fileObj, logInfo)
+			if logTmp.level >= ERROR {
 
-			if f.checkSize(f.errFileObj) {
-				f2, err := f.splitFile(f.errFileObj)
-				if err != nil {
-					return
+				if f.checkSize(f.errFileObj) {
+					f2, err := f.splitFile(f.errFileObj)
+					if err != nil {
+						return
+					}
+					f.errFileObj = f2
 				}
-				f.errFileObj = f2
+				fmt.Fprintf(f.errFileObj, "\n", logInfo)
 			}
-			fmt.Fprintf(f.errFileObj, "[%s] [%s][%s: %s: %d] %s \n", t.Format("2006-01-02 15:04:05"), paserLogString(lv), filename, funcname, lineNo, msg)
+		default:
+			//丢失日志保证运行
+			time.Sleep(time.Millisecond * 500)
 		}
+
+	}
+
+}
+
+//log 日志打印方法
+func (f *filelog) log(lv LogLevel, format string, arg ...interface{}) {
+	if f.enable(lv) {
+		msg := fmt.Sprintf(format, arg...)
+		t := time.Now()
+		funcname, filename, lineNo := getInfo(3)
+		//发送信息到通道中去写入
+		logTmp := &logMsg{
+			level:     lv,
+			msg:       msg,
+			funcName:  funcname,
+			filName:   filename,
+			timestmpe: t.Format("2006-01-02 15:04:05"),
+			line:      lineNo,
+		}
+		select {
+		case f.logchan <- logTmp:
+		default:
+			//丢弃日志保证代码的执行
+		}
+
 	}
 }
 
